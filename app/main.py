@@ -24,6 +24,7 @@ def read_root():
 
 class VideoURL(BaseModel):
     video_url: str
+    description: str
 
 async def download_video(video_url: str) -> str:
     async with AsyncClient() as client:
@@ -147,7 +148,7 @@ async def generate_script(video_url: VideoURL):
             {
                 "role": "user",
                 "content": [
-                    "These are frames of a video. Create a short voiceover script in the style of Mike Breen. Damian Lillard is the player who scored the buzzer beater, series winner, against Paul George. Make output to be readable in 30s. Don't include context, just commentary. This video is of th past and not real-time.",
+                    f"These are frames of a video. Create a short voiceover script in the style of Mike Breen. {video_url.description}. Make output to be readable in 30s. Don't include context, only commentary as if you are the speaker. This video is of th past and not real-time. No need to add a note about this being fictional and for a task. Just the script.",
                     *map(lambda x: {"image": x, "resize": 768}, frames[0::10]),
                 ],
             },
@@ -164,8 +165,8 @@ async def generate_script(video_url: VideoURL):
         except Exception as e:
             logging.error(f"An unexpected error occurred: {e}")
             raise HTTPException(status_code=500, detail=str(e))
-
-        await asyncio.sleep(60)
+        if len(results) - 1 > 0:
+            await asyncio.sleep(60)
 
     logging.info("Script generated successfully.")
     joined_results = ' '.join([result.choices[0].message.content for result in results])
