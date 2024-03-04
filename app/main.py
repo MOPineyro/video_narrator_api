@@ -10,6 +10,8 @@ import logging
 import asyncio
 from openai import AsyncOpenAI
 import time
+import subprocess
+import glob
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -73,6 +75,44 @@ def extract_frames(video_path: str) -> list:
     logging.info(f"Extraction complete. Total frames extracted: {len(base64_frames)}")
     return base64_frames
 
+def get_video_info(video_path: str):
+    command = [
+        'ffprobe',
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=pix_fmt',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        video_path
+    ]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return result.stdout.decode('utf-8').strip()
+
+def extract_frames_ffmpeg(video_path: str) -> list:
+    frame_rate = int(os.environ.get("FRAME_RATE", 5)) 
+    output_dir = tempfile.mkdtemp() 
+
+    pixel_format = get_video_info(video_path)
+
+    command = [
+        'ffmpeg',
+        '-i', video_path, 
+        '-vf', f'fps=1/{frame_rate}', 
+        '-pix_fmt', pixel_format,
+        f'{output_dir}/frame_%05d.jpg' 
+    ]
+    subprocess.run(command, check=True) 
+
+    # Read the frames from the output directory
+    base64_frames = []
+    for frame_file in sorted(glob.glob(f'{output_dir}/*.jpg')):
+        with open(frame_file, 'rb') as f:
+            base64_frames.append(base64.b64encode(f.read()).decode("utf-8"))
+        logging.info(f"Extracted frame {frame_file} as base64")
+
+    logging.info(f"Extraction complete. Total frames extracted: {len(base64_frames)}")
+    shutil.rmtree(output_dir)  
+    return base64_frames
+
 def chunk_frames(frames, chunk_size):
     for i in range(0, len(frames), chunk_size):
         yield frames[i:i + chunk_size]
@@ -87,7 +127,7 @@ async def generate_script(video_url: VideoURL):
         raise HTTPException(status_code=500, detail="Failed to download video.")
     
     logging.info("Video downloaded successfully. Extracting frames...")
-    base64_frames = extract_frames(video_path)
+    base64_frames = extract_frames_ffmpeg(video_path)
     shutil.rmtree(video_path, ignore_errors=True)
     if not base64_frames:
         logging.error("No frames extracted from video.")
@@ -107,7 +147,7 @@ async def generate_script(video_url: VideoURL):
             {
                 "role": "user",
                 "content": [
-                    "These are frames of a video. Create a short voiceover script in the style of Mike Breen. Damian Lillard is the player who scored the buzzer beater, series winner, against Paul George. Make output to be readable in 30s. Don't include context, just commentary.",
+                    "These are frames of a video. Create a short voiceover script in the style of Mike Breen. Damian Lillard is the player who scored the buzzer beater, series winner, against Paul George. Make output to be readable in 30s. Don't include context, just commentary. This video is of th past and not real-time.",
                     *map(lambda x: {"image": x, "resize": 768}, frames[0::10]),
                 ],
             },
