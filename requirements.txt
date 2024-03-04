@@ -3,3 +3,5 @@ uvicorn
 opencv-python-headless
 httpx
 python-multipart
+openai
+aiofiles
