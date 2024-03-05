@@ -1,0 +1,48 @@
+{
+    "_type": "export",
+    "__export_format": 4,
+    "__export_date": "2022-01-01T00:00:00.000Z",
+    "__export_source": "insomnia.desktop.app:v2021.5.2",
+    "resources": [
+      {
+        "_id": "req_1",
+        "_type": "request",
+        "name": "Root",
+        "method": "GET",
+        "url": "{{ base_url }}/",
+        "parameters": []
+      },
+      {
+        "_id": "req_2",
+        "_type": "request",
+        "name": "Get Script",
+        "method": "GET",
+        "url": "{{ base_url }}/get_script/{{ video_id }}",
+        "parameters": []
+      },
+      {
+        "_id": "req_3",
+        "_type": "request",
+        "name": "Generate Script",
+        "method": "POST",
+        "url": "{{ base_url }}/generate_script/",
+        "body": {
+          "mimeType": "application/json",
+          "text": "{\"video_url\": \"<video_url>\", \"description\": \"<description>\", \"callback_url\": \"<callback_url>\"}"
+        }
+      },
+      {
+        "_id": "env_base",
+        "_type": "environment",
+        "data": {
+          "base_url": "http://localhost:8000",
+          "video_id": "<video_id>"
+        }
+      },
+      {
+        "_id": "__WORKSPACE_ID__",
+        "_type": "workspace",
+        "name": "FastAPI Workspace"
+      }
+    ]
+  }

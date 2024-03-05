@@ -1,30 +1,130 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from pydantic import BaseModel, HttpUrl
 import shutil
 import cv2
 import base64
 import tempfile
-from httpx import AsyncClient, ReadTimeout
+from httpx import AsyncClient
 import os
 import logging
 import asyncio
 from openai import AsyncOpenAI
-import time
 import subprocess
 import glob
+from tinydb import TinyDB, Query
+import uuid
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
 app = FastAPI()
 openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+db = TinyDB('db.json')
+
+class VideoURL(BaseModel):
+    video_url: str
+    description: str
+    callback_url: HttpUrl = None
 
 @app.get("/")
 def read_root():
     return {"Hello": "from FastAPI running in a Docker container on Render!"}
 
-class VideoURL(BaseModel):
-    video_url: str
-    description: str
+@app.get("/get_script/{video_id}")
+async def get_script(video_id: str):
+    Video = Query()
+    result = db.search(Video.id == video_id)
+    if result:
+        return result[0]
+    else:
+        raise HTTPException(status_code=404, detail="Video not found.")
+
+@app.post("/generate_script/")
+async def generate_script(background_tasks: BackgroundTasks, video_url: VideoURL, force: bool = False):
+    Video = Query()
+    result = db.search(Video.url == video_url.video_url)
+    if result and not force:
+        logging.info(f"Found video in db. Returning cached result.")
+        return result[0]
+    
+    if result:
+        logging.info(f"Found video in db. Reusing video_id for forced processing.")
+        video_id = result[0]['id']
+    else:
+        video_id = str(uuid.uuid4())
+
+    if video_url.callback_url:
+        background_tasks.add_task(process_video, video_id, video_url, video_url.callback_url)
+        return {"id": video_id, "status": "processing"}
+    else:
+        script = await process_video(video_id, video_url)
+        return {"id": video_id, "script": script, "status": "done"}
+
+async def process_video(video_id: str, video_url: VideoURL, callback_url: str = None):
+    try: 
+        logging.info(f"Attempting to download video from URL: {video_url.video_url}")
+        video_path = await download_video(video_url.video_url)
+        if not video_path:
+            logging.error("Failed to download video.")
+            raise HTTPException(status_code=500, detail="Failed to download video.")
+        
+        logging.info("Video downloaded successfully. Extracting frames...")
+        base64_frames = extract_frames_ffmpeg(video_path)
+        shutil.rmtree(video_path, ignore_errors=True)
+        if not base64_frames:
+            logging.error("No frames extracted from video.")
+            raise HTTPException(status_code=500, detail="No frames extracted.")
+        
+        logging.info(f"Extracted {len(base64_frames)} frames. Generating script...")
+
+        # Define the chunk size, 150 is reasonable
+        chunk_size = 150
+        chunked_frames = list(chunk_frames(base64_frames, chunk_size))
+
+        results = []
+        for i, frames in enumerate(chunked_frames):
+            logging.info(f"Processing chunk {i+1} of {len(chunked_frames)}")
+
+            PROMPT_MESSAGES = [
+                {
+                    "role": "user",
+                    "content": [
+                        f"These are frames of a video. Create a short voiceover script in the style of Mike Breen. {video_url.description}. Make output to be readable in 30s. Don't include context, only commentary as if you are the speaker. This video is of th past and not real-time. No need to add a note about this being fictional and for a task. Just the script.",
+                        *map(lambda x: {"image": x, "resize": 768}, frames[0::10]),
+                    ],
+                },
+            ]
+
+            try:
+                result = await openai_client.chat.completions.create(
+                    messages=PROMPT_MESSAGES,
+                    model="gpt-4-vision-preview",
+                    max_tokens=500,
+                )
+                results.append(result)
+                logging.info(f"Completed request {i+1}")
+            except Exception as e:
+                logging.error(f"An unexpected error occurred: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+            if len(results) - 1 > 0:
+                await asyncio.sleep(60)
+
+        logging.info("Script generated successfully.")
+        joined_results = ' '.join([result.choices[0].message.content for result in results])
+
+        Video = Query()
+        new_data = {'url': video_url.video_url, 'script': joined_results, 'status': 'done', 'id': video_id}
+        db.upsert(new_data, Video.id == video_id)
+
+        if callback_url:
+            try:
+                async with AsyncClient() as client:
+                    await client.post(callback_url, json=new_data)
+            except Exception as e:
+                logging.error(f"Failed to send data to callback URL: {callback_url}. Error: {e}")
+
+        return joined_results
+    except Exception as e:
+        logging.error(f"An error occurred while processing the video: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 async def download_video(video_url: str) -> str:
     async with AsyncClient() as client:
@@ -119,58 +219,9 @@ def chunk_frames(frames, chunk_size):
         yield frames[i:i + chunk_size]
 
 
-@app.post("/generate_script/")
-async def generate_script(video_url: VideoURL):
-    logging.info(f"Attempting to download video from URL: {video_url.video_url}")
-    video_path = await download_video(video_url.video_url)
-    if not video_path:
-        logging.error("Failed to download video.")
-        raise HTTPException(status_code=500, detail="Failed to download video.")
-    
-    logging.info("Video downloaded successfully. Extracting frames...")
-    base64_frames = extract_frames_ffmpeg(video_path)
-    shutil.rmtree(video_path, ignore_errors=True)
-    if not base64_frames:
-        logging.error("No frames extracted from video.")
-        raise HTTPException(status_code=500, detail="No frames extracted.")
-    
-    logging.info(f"Extracted {len(base64_frames)} frames. Generating script...")
 
-    # Define the chunk size, 150 is reasonable
-    chunk_size = 150
-    chunked_frames = list(chunk_frames(base64_frames, chunk_size))
-
-    results = []
-    for i, frames in enumerate(chunked_frames):
-        logging.info(f"Processing chunk {i+1} of {len(chunked_frames)}")
-
-        PROMPT_MESSAGES = [
-            {
-                "role": "user",
-                "content": [
-                    f"These are frames of a video. Create a short voiceover script in the style of Mike Breen. {video_url.description}. Make output to be readable in 30s. Don't include context, only commentary as if you are the speaker. This video is of th past and not real-time. No need to add a note about this being fictional and for a task. Just the script.",
-                    *map(lambda x: {"image": x, "resize": 768}, frames[0::10]),
-                ],
-            },
-        ]
-
-        try:
-            result = await openai_client.chat.completions.create(
-                messages=PROMPT_MESSAGES,
-                model="gpt-4-vision-preview",
-                max_tokens=500,
-            )
-            results.append(result)
-            logging.info(f"Completed request {i+1}")
-        except Exception as e:
-            logging.error(f"An unexpected error occurred: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-        if len(results) - 1 > 0:
-            await asyncio.sleep(60)
-
-    logging.info("Script generated successfully.")
-    joined_results = ' '.join([result.choices[0].message.content for result in results])
-    return {"script": joined_results}
-
-
-# TODO: Optimize - store data of first image of video in db, compare before calling open ai to transcribe
+# TODO: 
+# Optimize - store data of first image of video in db, compare before calling open ai to transcribe
+# based on the # of frames, make lower / higher fidelity requests to openai
+# spin up job for video processing, return job id, then poll for job status
+# get length of video and make sure that the text is approx the same length
